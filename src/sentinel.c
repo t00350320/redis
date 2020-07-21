@@ -257,6 +257,8 @@ struct sentinelState {
     unsigned long simfailure_flags; /* Failures simulation. */
     int deny_scripts_reconfig; /* Allow SENTINEL SET ... to change script
                                   paths at runtime? */
+	unsigned int connections;// current sentinel and other sentinels' health connection numbers. 
+	int master_up_count;// master node is up status
 } sentinel;
 
 /* A script execution job. */
@@ -505,6 +507,8 @@ void initSentinel(void) {
     sentinel.announce_port = 0;
     sentinel.simfailure_flags = SENTINEL_SIMFAILURE_NONE;
     sentinel.deny_scripts_reconfig = SENTINEL_DEFAULT_DENY_SCRIPTS_RECONFIG;
+	sentinel.connections = 9999;
+	sentinel.master_up_count= 0;
     memset(sentinel.myid,0,sizeof(sentinel.myid));
 }
 
@@ -3726,6 +3730,21 @@ void sentinelCheckObjectivelyDown(sentinelRedisInstance *master) {
         }
         dictReleaseIterator(di);
         if (quorum >= master->quorum) odown = 1;
+
+		/*we asume current sentinel's master->flags is odown,if 
+		* 1)other sentinel connect number is 0 or
+		* 2) connect number < master->quorum, and none of these sentinels agree the master is up */
+		if ( sentinel.connections ==0 ||
+			((master->quorum > sentinel.connections) && 
+			(0 ==sentinel.master_up_count))
+			)
+
+		{		
+			odown =1;
+			serverLog(LL_WARNING,
+			"sentinel.connections:%d,master->quorum:%d,sentinel.master_up_count:%d", sentinel.connections
+			,master->quorum,sentinel.master_up_count);
+		}
     }
 
     /* Set the flag accordingly to the outcome. */
@@ -3768,6 +3787,7 @@ void sentinelReceiveIsMasterDownReply(redisAsyncContext *c, void *reply, void *p
             ri->flags |= SRI_MASTER_DOWN;
         } else {
             ri->flags &= ~SRI_MASTER_DOWN;
+			sentinel.master_up_count++;
         }
         if (strcmp(r->element[1]->str,"*")) {
             /* If the runid in the reply is not "*" the Sentinel actually
@@ -3792,7 +3812,7 @@ void sentinelReceiveIsMasterDownReply(redisAsyncContext *c, void *reply, void *p
 void sentinelAskMasterStateToOtherSentinels(sentinelRedisInstance *master, int flags) {
     dictIterator *di;
     dictEntry *de;
-
+	int count_connect=0;
     di = dictGetIterator(master->sentinels);
     while((de = dictNext(di)) != NULL) {
         sentinelRedisInstance *ri = dictGetVal(de);
@@ -3828,8 +3848,11 @@ void sentinelAskMasterStateToOtherSentinels(sentinelRedisInstance *master, int f
                     sentinel.current_epoch,
                     (master->failover_state > SENTINEL_FAILOVER_STATE_NONE) ?
                     sentinel.myid : "*");
+		// count  health sentinels
+		count_connect ++;
         if (retval == C_OK) ri->link->pending_commands++;
     }
+	sentinel.connections = count_connect;
     dictReleaseIterator(di);
 }
 
@@ -3959,7 +3982,21 @@ char *sentinelGetLeader(sentinelRedisInstance *master, uint64_t epoch) {
     }
 
     voters_quorum = voters/2+1;
-    if (winner && (max_votes < voters_quorum || max_votes < master->quorum))
+
+	/*we asume the leader is myid,if 
+	* 1)other sentinel connect number is 0 or
+	* 2) connect number < master->quorum, and none of these sentinels agree the master is up */
+	if (sentinel.connections ==0 ||
+		((master->quorum > sentinel.connections) && 
+		(0 ==sentinel.master_up_count)))
+	{
+
+		winner = winner ? sdsnew(winner) : sdsnew(sentinel.myid);
+		serverLog(LL_WARNING,
+		"some Sentinels abnormal,select current sentinel as leader:%s,%lu",
+		winner,leader_epoch);
+	}
+    else if (winner && (max_votes < voters_quorum || max_votes < master->quorum))
         winner = NULL;
 
     winner = winner ? sdsnew(winner) : NULL;
